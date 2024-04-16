@@ -1,6 +1,6 @@
 # Least Absolute Shrinkage and Selection Operator with Transfer Learning
 
-[(Takada & Fujisawa, 2020, NeurIPS)](https://papers.nips.cc/paper/2020/hash/a4a83056b58ff983d12c72bb17996243-Abstract.html) proposed a method for transferring knowledge from a source domain to a target domain via $\ell_1$ regularization in high dimension. [(Takada & Fujisawa 2023 arXiv)](https://arxiv.org/abs/2308.15838) extended the method to the weighted regularization to improve its theoretical properties. This is a simple implementation of the above methods.
+[(Takada & Fujisawa, 2020, NeurIPS)](https://papers.nips.cc/paper/2020/hash/a4a83056b58ff983d12c72bb17996243-Abstract.html) proposed a method for transferring knowledge from a source domain to a target domain via $\ell_1$ regularization in high dimension. [(Takada & Fujisawa, 2023, arXiv)](https://arxiv.org/abs/2308.15838) extended the method to the weighted regularization to improve its theoretical properties. This is a simple implementation of the above methods.
 
 ## Installation
 To install the package:
