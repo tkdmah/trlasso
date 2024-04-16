@@ -1,0 +1,542 @@
+---
+title: "Simple Simulation for Adaptive Transfer Lasso"
+author: "Masaaki Takada"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    # toc_float: 
+    #   collapsed: true
+    #   smooth_scroll: true
+---
+
+#  Simulations
+
+OLS vs Lasso vs Adaptive Lasso vs Transfer Lasso vs Adaptive Transfer Lasso
+
+```{r, cache=FALSE, autodep=TRUE}
+library(MASS)
+library(Rcpp)
+library(tidyverse)
+library(trlasso)
+library(plotly)
+```
+
+```{r, cache=TRUE, cache.lazy = FALSE, autodep=TRUE}
+r <- 0.5
+m_power <- 2
+p <- 10
+sigma <- 1
+
+n_list <- c(500, 5000)
+num <- 10
+
+k <- 1
+pf_max <- 1e12
+pf_min <- 1e-12
+pf_th <- 1e-12
+gamma <- 1
+gamma1 <- 1
+gamma2 <- 1
+eps <- 1e-8
+
+log_n_lambda_list <- seq(from = -2, to = 2, by = 1/8)
+log_n_eta_list <- seq(from = -2, to = 2, by = 1/8)
+```
+
+```{r, cache=TRUE, cache.lazy = FALSE, autodep=TRUE}
+evaluate_beta <- function(beta_hat, beta, X_random, y_random, X_fixed, y_fixed, 
+                          beta_tilde = 0) {
+  nonzero <- (abs(beta) >= 1e-12)
+  nonzero_hat <- (abs(beta_hat) >= 1e-12)
+  invariant <- (abs(beta_hat - beta_tilde) < 1e-12)
+  tibble(
+    rmse_random = sqrt(mean((y_random - X_random %*% beta_hat)^2)),
+    rmse_fixed = sqrt(mean((y_fixed - X_fixed %*% beta_hat)^2)),
+    l2 = sqrt(sum((beta_hat - beta)^2)),
+    sens = sum(nonzero_hat & nonzero) / max(sum(nonzero), 1),
+    spec = sum((!nonzero_hat) & (!nonzero)) / max(sum(!nonzero), 1),
+    ppv = sum(nonzero_hat & nonzero) / max(sum(nonzero_hat), 1),
+    fval = 2 / ((1/sens) + (1/ppv)),
+    acc = sum(nonzero_hat == nonzero) / length(nonzero),
+    inv_acc = sum(nonzero & invariant) / sum(nonzero),
+    num_nonzero = sum(nonzero_hat),
+    num_invariant = sum(invariant)
+    )
+}
+```
+
+```{r, cache=TRUE, cache.lazy = FALSE, autodep=TRUE}
+set.seed(0)
+
+results <- tibble()
+
+for (i in 1:num) {
+  print(paste0("i = ", i))
+  
+  for (n in n_list) {
+    res <- tibble()
+    print(paste0("n = ", n))
+    
+    ###### data generation #####
+
+    # coefficient
+    beta <- c(c(3, 1.5, 0, 0, 2), rep(0, length=p-5))
+    beta_source <- beta
+
+    # data
+    mu <- rep(0, length = p)
+    Sigma <- matrix(0, nrow = p, ncol = p)
+    for (j in 1:p) {
+      for (k in 1:p) {
+        Sigma[j, k] <- r^abs(j - k)
+      }
+    }
+    
+    # target data
+    if (r == 0) {
+      X <- matrix(rnorm(n = n * p, mean = 0, sd = 1), nrow = n, ncol = p)
+    } else {
+      X <- mvrnorm(n = n, mu = mu, Sigma = Sigma)
+    }
+    y <- X %*% beta + rnorm(n, mean = 0, sd = sigma)
+
+    # source data
+    m <- n^m_power
+    if (r == 0) {
+      X_source <- matrix(rnorm(n = m * p, mean = 0, sd = 1), 
+                         nrow = m, ncol = p)
+    } else {
+      X_source <- mvrnorm(n = m, mu = mu, Sigma = Sigma)
+    }
+    y_source <- X_source %*% beta_source + rnorm(m, mean = 0, sd = sigma)
+    
+    # test data (same X as target)
+    X_ts_fixed <- X
+    y_ts_fixed <- X_ts_fixed %*% beta + rnorm(n, mean = 0, sd = sigma)
+    
+    # test data (different X from target)
+    if (r == 0) {
+      X_ts_random <- matrix(rnorm(n = n * p, mean = 0, sd = 1), 
+                            nrow = n, ncol = p)
+    } else {
+      X_ts_random <- mvrnorm(n = n, mu = mu, Sigma = Sigma)
+    }
+    y_ts_random <- X_ts_random %*% beta + rnorm(n, mean = 0, sd = sigma)
+    
+    ###### modeling #####
+
+    # ols with source data
+    fit <- glm.fit(X_source, y_source)
+    beta_ols_source <- fit$coefficients
+    res <- res %>%
+      bind_rows(tibble(
+        method = "ols_source", 
+        evaluate_beta(beta_ols_source, beta, 
+                      X_ts_random, y_ts_random, X_ts_fixed, y_ts_fixed)
+      ))
+
+    # lasso
+    for (log_n_lambda in log_n_lambda_list) {
+      fit <- trlasso(X, y, lambda = k * n^log_n_lambda / n, eps = eps)
+      beta_lasso <- fit$beta[, 1]
+      res <- res %>%
+        bind_rows(tibble(
+          method = "lasso",
+          log_n_lambda = log_n_lambda,
+          evaluate_beta(beta_lasso, beta, 
+                        X_ts_random, y_ts_random, X_ts_fixed, y_ts_fixed)
+        ))
+    }
+
+    # adaptive lasso with ols
+    for (log_n_lambda in log_n_lambda_list) {
+      beta_tilde <- beta_ols_source
+      pf_lasso <- sapply(1/abs(beta_tilde)^gamma, function(b){max(min(b, pf_max), pf_min)})
+      fit <- trlasso(X, y, lambda = k * n^log_n_lambda / n, alpha = 1,
+                     penalty.factor.lasso = pf_lasso,
+                     penalty.factor.thresh = pf_th, eps = eps)
+      beta_alasso <- fit$beta[, 1]
+      res <- res %>%
+        bind_rows(tibble(
+          method = "alasso",
+          log_n_lambda = log_n_lambda,
+          evaluate_beta(beta_alasso, beta, 
+                        X_ts_random, y_ts_random, X_ts_fixed, y_ts_fixed, beta_tilde)
+        ))
+    }
+
+    # transfer lasso with ols
+    for (log_n_lambda in log_n_lambda_list) {
+      for (log_n_eta in log_n_eta_list) {
+        beta_tilde <- beta_ols_source
+        fit <- trlasso(X, y, 
+                       lambda = k * (n^log_n_lambda + n^log_n_eta) / n, 
+                       alpha = n^log_n_lambda / (n^log_n_lambda + n^log_n_eta),
+                       beta_tilde = beta_tilde,
+                       penalty.factor.thresh = pf_th, eps = eps)
+        beta_trlasso <- fit$beta[, 1]
+        res <- res %>%
+          bind_rows(tibble(
+            method = "trlasso",
+            log_n_lambda = log_n_lambda,
+            log_n_eta = log_n_eta,
+            evaluate_beta(beta_trlasso, beta, 
+                          X_ts_random, y_ts_random, X_ts_fixed, y_ts_fixed, beta_tilde)
+          ))
+      }
+    }
+
+    # adaptive transfer lasso with ols
+    for (log_n_lambda in log_n_lambda_list) {
+      for (log_n_eta in log_n_eta_list) {
+        beta_tilde <- beta_ols_source
+        pf_lasso <- sapply(1/abs(beta_tilde)^gamma1, function(b){max(min(b, pf_max), pf_min)})
+        pf_trlasso <- sapply(abs(beta_tilde)^gamma2, function(b){max(min(b, pf_max), pf_min)})
+        fit <- trlasso(X, y, 
+                       lambda = k * (n^log_n_lambda + n^log_n_eta) / n, 
+                       alpha = n^log_n_lambda / (n^log_n_lambda + n^log_n_eta),
+                       beta_tilde = beta_tilde, 
+                       penalty.factor.lasso = pf_lasso,
+                       penalty.factor.trlasso = pf_trlasso,
+                       penalty.factor.thresh = pf_th, eps = eps)
+        beta_atrlasso <- fit$beta[, 1]
+        res <- res %>%
+          bind_rows(tibble(
+            method = "atrlasso",
+            log_n_lambda = log_n_lambda,
+            log_n_eta = log_n_eta,
+            evaluate_beta(beta_atrlasso, beta, 
+                          X_ts_random, y_ts_random, X_ts_fixed, y_ts_fixed, beta_tilde)
+          ))
+      }
+    }
+    
+    results <- results %>%
+      bind_rows(tibble(
+        res %>%
+          dplyr::mutate(
+            i = i,
+            n = n,
+            m = m,
+            p = p,
+            sigma = sigma
+            )
+        ))
+  }
+}
+```
+
+# Summary
+```{r, cache=FALSE, autodep=TRUE}
+results <- results %>%
+  dplyr::mutate(method = factor(method, levels = c(
+    "ols_source", "lasso_source",
+    "ols", "lasso", "alasso", "trlasso", "atrlasso"
+  )))
+
+summary <- results %>%
+  dplyr::select(-i) %>%
+  dplyr::group_by(method, n, m, p, sigma, log_n_lambda, log_n_eta) %>%
+  dplyr::summarise_all(list(mean = ~ mean(., na.rm = TRUE), se = ~ sd(., na.rm = TRUE) / sqrt(n())))
+
+DT::datatable(summary)
+```
+
+# Trade-off Diagram for AdapTrLasso
+
+## Convergence Rate
+
+```{r, cache=FALSE, autodep=TRUE, fig.width=7, fig.height=4, dpi=200}
+summary %>%
+  filter(method == "atrlasso") %>%
+  group_by(log_n_lambda, log_n_eta) %>%
+  summarise(convergence_rate = -(log10(l2_mean[which.max(n)]) - log10(l2_mean[which.min(n)])) / (log10(max(n)) - log10(min(n))), .groups = "keep") %>%
+  ggplot(aes(x = log_n_eta, y = log_n_lambda, fill = convergence_rate)) +
+  geom_tile() +
+  scale_fill_gradient2(limits = c(-1, 1.1), midpoint = 0, oob = ~ scales::squish(., range = c(-1, 1.1))) +
+  scale_x_continuous(breaks = seq(-2, 2, 1/2)) +
+  scale_y_continuous(breaks = seq(-2, 2, 1/2)) +
+  geom_segment(aes(x = -2-1/16, y = 0.5, xend = 0.5, yend = 0.5), 
+               linetype = "dashed", color = "gray40") +
+  geom_segment(aes(x = 0.5, y = 0.5, xend = 2+1/16, yend = 2+1/16), 
+               linetype = "dashed", color = "gray40") +
+  geom_segment(aes(x = -2-1/16, y = 1, xend = 1, yend = 1), 
+               linetype = "dashed", color = "gray40") +
+  geom_segment(aes(x = 0.5, y = -2-1/16, xend = 0.5, yend = 0.5), 
+               linetype = "dashed", color = "gray40") +
+  geom_segment(aes(x = 1.5, y = -2-1/16, xend = 1.5, yend = -0.5), 
+               linetype = "dashed", color = "gray40") +
+  geom_segment(aes(x = -2-1/16, y = -0.5, xend = 1.5, yend = -0.5), 
+               linetype = "dashed", color = "gray40") +
+  geom_segment(aes(x = 1.5, y = -0.5, xend = 2+1/16, yend = 0+1/16), 
+               linetype = "dashed", color = "gray40") +
+  theme(text = element_text(size = 15)) + 
+  coord_fixed()
+```
+
+## Active Variable Selection Consistency
+
+```{r, cache=FALSE, autodep=TRUE, fig.width=7, fig.height=4, dpi=200}
+summary %>%
+  filter(method == "atrlasso") %>%
+  group_by(log_n_lambda, log_n_eta) %>%
+  summarise(active_selection_ratio = acc_mean[which.max(n)], .groups = "keep") %>%
+  ggplot(aes(x = log_n_eta, y = log_n_lambda, fill = active_selection_ratio)) +
+  geom_tile() +
+  scale_fill_continuous(limits = c(0, 1.1), high = "#132B43", low = "#56B1F7") +
+  scale_x_continuous(breaks = seq(-2, 2, 1/2)) +
+  scale_y_continuous(breaks = seq(-2, 2, 1/2)) +
+  geom_segment(aes(x = -2-1/16, y = 0.5, xend = 0.5, yend = 0.5), 
+               linetype = "dashed", color = "gray40") +
+  geom_segment(aes(x = 0.5, y = 0.5, xend = 2+1/16, yend = 2+1/16), 
+               linetype = "dashed", color = "gray40") +
+  geom_segment(aes(x = -2-1/16, y = 1, xend = 1, yend = 1), 
+               linetype = "dashed", color = "gray40") +
+  geom_segment(aes(x = 0.5, y = -2-1/16, xend = 0.5, yend = 0.5), 
+               linetype = "dashed", color = "gray40") +
+  geom_segment(aes(x = 1.5, y = -2-1/16, xend = 1.5, yend = -0.5), 
+               linetype = "dashed", color = "gray40") +
+  geom_segment(aes(x = -2-1/16, y = -0.5, xend = 1.5, yend = -0.5), 
+               linetype = "dashed", color = "gray40") +
+  geom_segment(aes(x = 1.5, y = -0.5, xend = 2+1/16, yend = 0+1/16), 
+               linetype = "dashed", color = "gray40") +
+  theme(text = element_text(size = 15)) + 
+  coord_fixed()
+```
+
+
+## Invariant Variable Selection Consistency
+
+```{r, cache=FALSE, autodep=TRUE, fig.width=7, fig.height=4, dpi=200}
+summary %>%
+  filter(method == "atrlasso") %>%
+  group_by(log_n_lambda, log_n_eta) %>%
+  summarise(invariant_selection_ratio = inv_acc_mean[which.max(n)], .groups = "keep") %>%
+  ggplot(aes(x = log_n_eta, y = log_n_lambda, fill = invariant_selection_ratio)) +
+  geom_tile() +
+  scale_fill_continuous(limits = c(0, 1.1), high = "#132B43", low = "#56B1F7") +
+  scale_x_continuous(breaks = seq(-2, 2, 1/2)) +
+  scale_y_continuous(breaks = seq(-2, 2, 1/2)) +
+  geom_segment(aes(x = -2-1/16, y = 0.5, xend = 0.5, yend = 0.5), 
+               linetype = "dashed", color = "gray40") +
+  geom_segment(aes(x = 0.5, y = 0.5, xend = 2+1/16, yend = 2+1/16), 
+               linetype = "dashed", color = "gray40") +
+  geom_segment(aes(x = -2-1/16, y = 1, xend = 1, yend = 1), 
+               linetype = "dashed", color = "gray40") +
+  geom_segment(aes(x = 0.5, y = -2-1/16, xend = 0.5, yend = 0.5), 
+               linetype = "dashed", color = "gray40") +
+  geom_segment(aes(x = 1.5, y = -2-1/16, xend = 1.5, yend = -0.5), 
+               linetype = "dashed", color = "gray40") +
+  geom_segment(aes(x = -2-1/16, y = -0.5, xend = 1.5, yend = -0.5), 
+               linetype = "dashed", color = "gray40") +
+  geom_segment(aes(x = 1.5, y = -0.5, xend = 2+1/16, yend = 0+1/16), 
+               linetype = "dashed", color = "gray40") +
+  theme(text = element_text(size = 15)) + 
+  coord_fixed()
+```
+
+
+# Trade-off Diagram for TrLasso
+
+## Convergence Rate
+
+```{r, cache=FALSE, autodep=TRUE, fig.width=7, fig.height=4, dpi=200}
+summary %>%
+  filter(method == "trlasso") %>%
+  group_by(log_n_lambda, log_n_eta) %>%
+  summarise(convergence_rate = -(log10(l2_mean[which.max(n)]) - log10(l2_mean[which.min(n)])) / (log10(max(n)) - log10(min(n))), .groups = "keep") %>%
+  ggplot(aes(x = log_n_eta, y = log_n_lambda, fill = convergence_rate)) +
+  geom_tile() +
+  scale_fill_gradient2(limits = c(-1, 1.1), midpoint = 0, oob = ~ scales::squish(., range = c(-1, 1.1))) +
+  scale_x_continuous(breaks = seq(-2, 2, 1/2)) +
+  scale_y_continuous(breaks = seq(-2, 2, 1/2)) +
+  geom_segment(aes(x = -2-1/16, y = 0.5, xend = 0.5, yend = 0.5), 
+               linetype = "dashed", color = "gray40") +
+  geom_segment(aes(x = -2-1/16, y = 1, xend = 1, yend = 1), 
+               linetype = "dashed", color = "gray40") +
+  geom_segment(aes(x = 0.5, y = 0.5, xend = 2+1/16, yend = 2+1/16), 
+               linetype = "dashed", color = "gray40") +
+  geom_segment(aes(x = 0.5, y = -2-1/16, xend = 0.5, yend = 0.5), 
+               linetype = "dashed", color = "gray40") +
+  theme(text = element_text(size = 15)) + 
+  coord_fixed()
+```
+
+## Active Variable Selection Consistency
+
+```{r, cache=FALSE, autodep=TRUE, fig.width=7, fig.height=4, dpi=200}
+summary %>%
+  filter(method == "trlasso") %>%
+  group_by(log_n_lambda, log_n_eta) %>%
+  summarise(active_selection_ratio = acc_mean[which.max(n)], .groups = "keep") %>%
+  ggplot(aes(x = log_n_eta, y = log_n_lambda, fill = active_selection_ratio)) +
+  geom_tile() +
+  scale_fill_continuous(limits = c(0, 1.1), high = "#132B43", low = "#56B1F7") +
+  scale_x_continuous(breaks = seq(-2, 2, 1/2)) +
+  scale_y_continuous(breaks = seq(-2, 2, 1/2)) +
+  geom_segment(aes(x = -2-1/16, y = 0.5, xend = 0.5, yend = 0.5), 
+               linetype = "dashed", color = "gray40") +
+  geom_segment(aes(x = -2-1/16, y = 1, xend = 1, yend = 1), 
+               linetype = "dashed", color = "gray40") +
+  geom_segment(aes(x = 0.5, y = 0.5, xend = 2+1/16, yend = 2+1/16), 
+               linetype = "dashed", color = "gray40") +
+  geom_segment(aes(x = 0.5, y = -2-1/16, xend = 0.5, yend = 0.5), 
+               linetype = "dashed", color = "gray40") +
+  theme(text = element_text(size = 15)) + 
+  coord_fixed()
+```
+
+
+## Invariant Variable Selection Consistency
+
+```{r, cache=FALSE, autodep=TRUE, fig.width=7, fig.height=4, dpi=200}
+summary %>%
+  filter(method == "trlasso") %>%
+  group_by(log_n_lambda, log_n_eta) %>%
+  summarise(invariant_selection_ratio = inv_acc_mean[which.max(n)], .groups = "keep") %>%
+  ggplot(aes(x = log_n_eta, y = log_n_lambda, fill = invariant_selection_ratio)) +
+  geom_tile() +
+  scale_fill_continuous(limits = c(0, 1.1), high = "#132B43", low = "#56B1F7") +
+  scale_x_continuous(breaks = seq(-2, 2, 1/2)) +
+  scale_y_continuous(breaks = seq(-2, 2, 1/2)) +
+  geom_segment(aes(x = -2-1/16, y = 0.5, xend = 0.5, yend = 0.5), 
+               linetype = "dashed", color = "gray40") +
+  geom_segment(aes(x = -2-1/16, y = 1, xend = 1, yend = 1), 
+               linetype = "dashed", color = "gray40") +
+  geom_segment(aes(x = 0.5, y = 0.5, xend = 2+1/16, yend = 2+1/16), 
+               linetype = "dashed", color = "gray40") +
+  geom_segment(aes(x = 0.5, y = -2-1/16, xend = 0.5, yend = 0.5), 
+               linetype = "dashed", color = "gray40") +
+  theme(text = element_text(size = 15)) + 
+  coord_fixed()
+```
+
+# Trade-off Diagram for AdaptLasso
+
+## Convergence Rate
+
+```{r, cache=FALSE, autodep=TRUE, fig.width=7, fig.height=4, dpi=200}
+summary %>%
+  filter(method == "alasso") %>%
+  group_by(log_n_lambda) %>%
+  summarise(convergence_rate = -(log10(l2_mean[which.max(n)]) - log10(l2_mean[which.min(n)])) / (log10(max(n)) - log10(min(n))), .groups = "keep") %>%
+  ggplot(aes(x = 0, y = log_n_lambda, fill = convergence_rate)) +
+  geom_tile() +
+  scale_y_continuous(breaks = seq(-2, 2, 1/2)) +
+  scale_fill_gradient2(limits = c(-1, 1.1), midpoint = 0, oob = ~ scales::squish(., range = c(-1, 1.1))) +
+  geom_segment(aes(x = -0.5, y = 1, xend = 0.5, yend = 1), 
+               linetype = "dashed", color = "gray40") +
+  geom_segment(aes(x = -0.5, y = 0.5, xend = 0.5, yend = 0.5), 
+               linetype = "dashed", color = "gray40") +
+  geom_segment(aes(x = -0.5, y = 0.5-m_power/2, xend = 0.5, yend = 0.5-m_power/2), 
+               linetype = "dashed", color = "gray40") +
+  theme(text = element_text(size = 15)) + 
+  coord_fixed()
+```
+
+## Active Variable Selection Consistency
+
+```{r, cache=FALSE, autodep=TRUE, fig.width=7, fig.height=4, dpi=200}
+summary %>%
+  filter(method == "alasso") %>%
+  group_by(log_n_lambda) %>%
+  summarise(active_selection_ratio = acc_mean[which.max(n)], .groups = "keep") %>%
+  ggplot(aes(x = 0, y = log_n_lambda, fill = active_selection_ratio)) +
+  geom_tile() +
+  scale_fill_continuous(limits = c(0, 1.1), high = "#132B43", low = "#56B1F7") +
+  scale_fill_continuous(high = "#132B43", low = "#56B1F7") +
+  geom_segment(aes(x = -0.5, y = 1, xend = 0.5, yend = 1), 
+               linetype = "dashed", color = "gray40") +
+  geom_segment(aes(x = -0.5, y = 0.5, xend = 0.5, yend = 0.5), 
+               linetype = "dashed", color = "gray40") +
+  geom_segment(aes(x = -0.5, y = 0.5-m_power/2, xend = 0.5, yend = 0.5-m_power/2), 
+               linetype = "dashed", color = "gray40") +
+  theme(text = element_text(size = 15)) + 
+  coord_fixed()
+```
+
+
+## Invariant Variable Selection Consistency
+
+```{r, cache=FALSE, autodep=TRUE, fig.width=7, fig.height=4, dpi=200}
+summary %>%
+  filter(method == "alasso") %>%
+  group_by(log_n_lambda) %>%
+  summarise(invariant_selection_ratio = inv_acc_mean[which.max(n)], .groups = "keep") %>%
+  ggplot(aes(x = 0, y = log_n_lambda, fill = invariant_selection_ratio)) +
+  geom_tile() +
+  scale_y_continuous(breaks = seq(-2, 2, 1/2)) +
+  scale_fill_continuous(limits = c(0, 1.1), high = "#132B43", low = "#56B1F7") +
+  scale_fill_continuous(high = "#132B43", low = "#56B1F7") +
+  geom_segment(aes(x = -0.5, y = 1, xend = 0.5, yend = 1), 
+               linetype = "dashed", color = "gray40") +
+  geom_segment(aes(x = -0.5, y = 0.5, xend = 0.5, yend = 0.5), 
+               linetype = "dashed", color = "gray40") +
+  geom_segment(aes(x = -0.5, y = 0.5-m_power/2, xend = 0.5, yend = 0.5-m_power/2), 
+               linetype = "dashed", color = "gray40") +
+  theme(text = element_text(size = 15)) + 
+  coord_fixed()
+```
+
+
+# Trade-off Diagram for Lasso
+
+## Convergence Rate
+
+```{r, cache=FALSE, autodep=TRUE, fig.width=7, fig.height=4, dpi=200}
+summary %>%
+  filter(method == "lasso") %>%
+  group_by(log_n_lambda) %>%
+  summarise(convergence_rate = -(log10(l2_mean[which.max(n)]) - log10(l2_mean[which.min(n)])) / (log10(max(n)) - log10(min(n))), .groups = "keep") %>%
+  ggplot(aes(x = 0, y = log_n_lambda, fill = convergence_rate)) +
+  geom_tile() +
+  scale_y_continuous(breaks = seq(-2, 2, 1/2)) +
+  scale_fill_gradient2(limits = c(-1, 1.1), midpoint = 0, oob = ~ scales::squish(., range = c(-1, 1.1))) +
+  geom_segment(aes(x = -0.5, y = 1, xend = 0.5, yend = 1), 
+               linetype = "dashed", color = "gray40") +
+  geom_segment(aes(x = -0.5, y = 0.5, xend = 0.5, yend = 0.5), 
+               linetype = "dashed", color = "gray40") +
+  theme(text = element_text(size = 15)) + 
+  coord_fixed()
+```
+
+## Active Variable Selection Consistency
+
+```{r, cache=FALSE, autodep=TRUE, fig.width=7, fig.height=4, dpi=200}
+summary %>%
+  filter(method == "lasso") %>%
+  group_by(log_n_lambda) %>%
+  summarise(active_selection_ratio = acc_mean[which.max(n)], .groups = "keep") %>%
+  ggplot(aes(x = 0, y = log_n_lambda, fill = active_selection_ratio)) +
+  geom_tile() +
+  scale_y_continuous(breaks = seq(-2, 2, 1/2)) +
+  scale_fill_continuous(limits = c(0, 1.1), high = "#132B43", low = "#56B1F7") +
+  geom_segment(aes(x = -0.5, y = 1, xend = 0.5, yend = 1), 
+               linetype = "dashed", color = "gray40") +
+  geom_segment(aes(x = -0.5, y = 0.5, xend = 0.5, yend = 0.5), 
+               linetype = "dashed", color = "gray40") +
+  theme(text = element_text(size = 15)) + 
+  coord_fixed()
+```
+
+
+## Invariant Variable Selection Consistency
+
+```{r, cache=FALSE, autodep=TRUE, fig.width=7, fig.height=4, dpi=200}
+summary %>%
+  filter(method == "lasso") %>%
+  group_by(log_n_lambda) %>%
+  summarise(invariant_selection_ratio = inv_acc_mean[which.max(n)], .groups = "keep") %>%
+  ggplot(aes(x = 0, y = log_n_lambda, fill = invariant_selection_ratio)) +
+  geom_tile() +
+  scale_y_continuous(breaks = seq(-2, 2, 1/2)) +
+  scale_fill_continuous(limits = c(0, 1.1), high = "#132B43", low = "#56B1F7") +
+  geom_segment(aes(x = -0.5, y = 1, xend = 0.5, yend = 1), 
+               linetype = "dashed", color = "gray40") +
+  geom_segment(aes(x = -0.5, y = 0.5, xend = 0.5, yend = 0.5), 
+               linetype = "dashed", color = "gray40") +
+  theme(text = element_text(size = 15)) + 
+  coord_fixed()
+```

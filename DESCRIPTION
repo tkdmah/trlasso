@@ -1,0 +1,15 @@
+Package: trlasso
+Type: Package
+Title: Least Absolute Shrinkage and Selection Operator with Transfer Learning
+Version: 1.0
+Date: 2024-03-08
+Author: Masaaki Takada, Gen Li, Sunao Yotsutsuji
+Maintainer: Masaaki Takada <masaaki1.takada@toshiba.co.jp>
+Description: (Takada & Fujisawa, 2020, NeurIPS) proposed a method for transferring knowledge from a source domain to a target domain via $\ell_1$ regularization in high dimension. In addition, (Takada & Fujisawa, 2023, arXiv) extended the method to the weighted regularization to improve its theoretical properties. This is a simple implementation of the above methods.
+URL: https://papers.nips.cc/paper/2020/hash/a4a83056b58ff983d12c72bb17996243-Abstract.html, https://arxiv.org/abs/2308.15838
+License: MIT + file LICENSE
+Imports: Rcpp (>= 1.0.5), MASS, Matrix
+LinkingTo: Rcpp, BH
+Suggests: knitr, rmarkdown, testthat, glmnet, tidyverse, plotly, patchwork
+RoxygenNote: 7.2.3
+VignetteBuilder: knitr

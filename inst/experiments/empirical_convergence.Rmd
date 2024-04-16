@@ -1,0 +1,369 @@
+---
+title: "Simple Simulation for Adaptive Transfer Lasso"
+author: "Masaaki Takada"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    # toc_float: 
+    #   collapsed: true
+    #   smooth_scroll: true
+---
+
+#  Simulations
+
+OLS vs Lasso vs Adaptive Lasso vs Transfer Lasso vs Adaptive Transfer Lasso
+
+```{r, cache=FALSE, autodep=TRUE}
+library(MASS)
+library(Rcpp)
+library(tidyverse)
+library(trlasso)
+library(plotly)
+library(patchwork)
+```
+
+```{r, cache=TRUE, autodep=TRUE}
+r <- 0.5
+m_power <- 2
+p <- 10
+sigma <- 1
+
+n_list <- c(20, 50, 100, 200, 500, 1000, 2000, 5000)
+num <- 10
+
+k <- 1
+pf_max <- 1e12
+pf_min <- 1e-12
+pf_th <- 1e-12
+gamma <- 1
+gamma1 <- 1
+gamma2 <- 1
+eps <- 1e-8
+
+log_n_lambda_lasso <- tribble(
+  ~region, ~lambda,
+  "i", 1/4,
+  "ii", 3/4
+)
+log_n_lambda_alasso <- tribble(
+  ~region, ~lambda,
+  "i", -m_power/2,
+  "ii", 1/4,
+  "iii", 3/4
+)
+log_n_lambda_eta_trlasso <- tribble(
+  ~region, ~lambda, ~eta,
+  "i", 1/2, 3/4,
+  "ii", 1/4, 1/4,
+  "iii", 3/4, 1/2
+)
+log_n_lambda_eta_atrlasso <- tribble(
+  ~region, ~lambda, ~eta,
+  "i", (1-m_power)/2, (2+m_power)/2,
+  "ii", 1/2, (1+m_power)/2,
+  "iii", -m_power/2, 1/4,
+  "iv", -m_power/2, (1+m_power/2)/2,
+  "v", (1-m_power/2)/2, 1/4,
+  "vi", 3/4, 1/2
+)
+```
+
+```{r, cache=TRUE, autodep=TRUE}
+evaluate_beta <- function(beta_hat, beta, X_random, y_random, X_fixed, y_fixed, 
+                          beta_tilde = 0) {
+  nonzero <- (abs(beta) >= 1e-12)
+  nonzero_hat <- (abs(beta_hat) >= 1e-12)
+  invariant <- (abs(beta_hat - beta_tilde) < 1e-12)
+  tibble(
+    rmse_random = sqrt(mean((y_random - X_random %*% beta_hat)^2)),
+    rmse_fixed = sqrt(mean((y_fixed - X_fixed %*% beta_hat)^2)),
+    l2 = sqrt(sum((beta_hat - beta)^2)),
+    sens = sum(nonzero_hat & nonzero) / max(sum(nonzero), 1),
+    spec = sum((!nonzero_hat) & (!nonzero)) / max(sum(!nonzero), 1),
+    ppv = sum(nonzero_hat & nonzero) / max(sum(nonzero_hat), 1),
+    fval = 2 / ((1/sens) + (1/ppv)),
+    acc = sum(nonzero_hat == nonzero) / length(nonzero),
+    inv_acc = sum(nonzero & invariant) / sum(nonzero),
+    num_nonzero = sum(nonzero_hat),
+    num_invariant = sum(invariant)
+    )
+}
+```
+
+```{r, cache=TRUE, autodep=TRUE}
+set.seed(0)
+
+results <- tibble()
+
+for (i in 1:num) {
+  print(paste0("i = ", i))
+  
+  for (n in n_list) {
+    res <- tibble()
+    
+    ###### data generation #####
+
+    # coefficient
+    beta <- c(c(3, 1.5, 0, 0, 2), rep(0, length=p-5))
+    # beta <- c(1, rep(0, length=p-1))
+    beta_source <- beta
+
+    # target data
+    X <- matrix(rnorm(n = n * p, mean = 0, sd = 1), nrow = n, ncol = p)
+    y <- X %*% beta + rnorm(n, mean = 0, sd = sigma)
+
+    # source data
+    m <- n^m_power
+    X_source <- matrix(rnorm(n = m * p, mean = 0, sd = 1), nrow = m, ncol = p)
+    y_source <- X_source %*% beta_source + rnorm(m, mean = 0, sd = sigma)
+    
+    # test data (same X as target)
+    X_ts_fixed <- X
+    y_ts_fixed <- X_ts_fixed %*% beta + rnorm(n, mean = 0, sd = sigma)
+    
+    # test data (different X from target)
+    X_ts_random <- matrix(rnorm(n = n * p, mean = 0, sd = 1), nrow = n, ncol = p)
+    y_ts_random <- X_ts_random %*% beta + rnorm(n, mean = 0, sd = sigma)
+    
+    ###### modeling #####
+
+    # ols with source data
+    fit <- glm.fit(X_source, y_source)
+    beta_ols_source <- fit$coefficients
+    res <- res %>%
+      bind_rows(tibble(
+        method = "ols_source", 
+        evaluate_beta(beta_ols_source, beta, 
+                      X_ts_random, y_ts_random, X_ts_fixed, y_ts_fixed)
+      ))
+
+    # lasso
+    for (lambda_index in 1:nrow(log_n_lambda_lasso)) {
+      log_n_lambda <- log_n_lambda_lasso$lambda[lambda_index]
+      fit <- trlasso(X, y, lambda = k * n^log_n_lambda / n, eps = eps)
+      beta_lasso <- fit$beta[, 1]
+      res <- res %>%
+        bind_rows(tibble(
+          method = "lasso",
+          region = log_n_lambda_lasso$region[lambda_index],
+          log_n_lambda = log_n_lambda,
+          evaluate_beta(beta_lasso, beta, 
+                        X_ts_random, y_ts_random, X_ts_fixed, y_ts_fixed)
+        ))
+    }
+
+    # adaptive lasso with ols
+    for (lambda_index in 1:nrow(log_n_lambda_alasso)) {
+      log_n_lambda <- log_n_lambda_alasso$lambda[lambda_index]
+      beta_tilde <- beta_ols_source
+      pf_lasso <- sapply(1/abs(beta_tilde)^gamma, function(b){max(min(b, pf_max), pf_min)})
+      fit <- trlasso(X, y, lambda = k * n^log_n_lambda / n, alpha = 1,
+                     penalty.factor.lasso = pf_lasso,
+                     penalty.factor.thresh = pf_th, eps = eps)
+      beta_alasso <- fit$beta[, 1]
+      res <- res %>%
+        bind_rows(tibble(
+          method = "alasso",
+          region = log_n_lambda_alasso$region[lambda_index],
+          log_n_lambda = log_n_lambda,
+          evaluate_beta(beta_alasso, beta, 
+                        X_ts_random, y_ts_random, X_ts_fixed, y_ts_fixed, beta_tilde)
+        ))
+    }
+
+    # transfer lasso with ols
+    for (lambda_eta_index in 1:nrow(log_n_lambda_eta_trlasso)) {
+      log_n_lambda <- log_n_lambda_eta_trlasso$lambda[lambda_eta_index]
+      log_n_eta <- log_n_lambda_eta_trlasso$eta[lambda_eta_index]
+      beta_tilde <- beta_ols_source
+      fit <- trlasso(X, y, 
+                     lambda = k * (n^log_n_lambda + n^log_n_eta) / n, 
+                     alpha = n^log_n_lambda / (n^log_n_lambda + n^log_n_eta),
+                     beta_tilde = beta_tilde,
+                     penalty.factor.thresh = pf_th, eps = eps)
+      beta_trlasso <- fit$beta[, 1]
+      res <- res %>%
+        bind_rows(tibble(
+          method = "trlasso",
+          region = log_n_lambda_eta_trlasso$region[lambda_eta_index],
+          log_n_lambda = log_n_lambda,
+          log_n_eta = log_n_eta,
+          evaluate_beta(beta_trlasso, beta, 
+                        X_ts_random, y_ts_random, X_ts_fixed, y_ts_fixed, beta_tilde)
+        ))
+    }
+
+    # adaptive transfer lasso with ols
+    for (lambda_eta_index in 1:nrow(log_n_lambda_eta_atrlasso)) {
+      log_n_lambda <- log_n_lambda_eta_atrlasso$lambda[lambda_eta_index]
+      log_n_eta <- log_n_lambda_eta_atrlasso$eta[lambda_eta_index]
+      beta_tilde <- beta_ols_source
+      pf_lasso <- sapply(1/abs(beta_tilde)^gamma1, function(b){max(min(b, pf_max), pf_min)})
+      pf_trlasso <- sapply(abs(beta_tilde)^gamma2, function(b){max(min(b, pf_max), pf_min)})
+      fit <- trlasso(X, y, 
+                     lambda = k * (n^log_n_lambda + n^log_n_eta) / n, 
+                     alpha = n^log_n_lambda / (n^log_n_lambda + n^log_n_eta),
+                     beta_tilde = beta_tilde, 
+                     penalty.factor.lasso = pf_lasso,
+                     penalty.factor.trlasso = pf_trlasso,
+                     penalty.factor.thresh = pf_th, eps = eps)
+      beta_atrlasso <- fit$beta[, 1]
+      res <- res %>%
+        bind_rows(tibble(
+          method = "atrlasso",
+          region = log_n_lambda_eta_atrlasso$region[lambda_eta_index],
+          log_n_lambda = log_n_lambda,
+          log_n_eta = log_n_eta,
+          evaluate_beta(beta_atrlasso, beta, 
+                        X_ts_random, y_ts_random, X_ts_fixed, y_ts_fixed, beta_tilde)
+        ))
+    }
+    
+    results <- results %>%
+      bind_rows(tibble(
+        res %>%
+          dplyr::mutate(
+            i = i,
+            n = n,
+            m = m,
+            p = p,
+            sigma = sigma
+            )
+        ))
+  }
+}
+```
+
+# Summary
+```{r, cache=FALSE, autodep=TRUE}
+results <- results %>%
+  dplyr::mutate(method = factor(method, levels = c(
+    "ols_source", "lasso_source",
+    "ols", "lasso", "alasso", "trlasso", "atrlasso"
+  )))
+
+summary <- results %>%
+  dplyr::select(-i) %>%
+  dplyr::group_by(method, n, m, p, sigma, region, log_n_lambda, log_n_eta) %>%
+  dplyr::summarise_all(list(mean = ~ mean(., na.rm = TRUE), se = ~ sd(., na.rm = TRUE) / sqrt(n()))) %>%
+  ungroup()
+
+DT::datatable(summary)
+```
+
+# Theory Verification
+
+## Convergence Rate
+
+```{r, cache=FALSE, autodep=TRUE, fig.width=7, fig.height=4, dpi=200}
+g <- results %>%
+  filter(method %in% c("lasso", "alasso", "trlasso", "atrlasso")) %>%
+  ggplot(aes(x = n, y = l2, shape = factor(i))) +
+  geom_line(aes(colour = region, linetype = region)) +
+  facet_wrap("method") +
+  scale_x_log10() + 
+  scale_y_log10() + 
+  theme(text = element_text(size = 7))
+plot(g)
+ggplotly(g)
+```
+
+```{r, cache=FALSE, autodep=TRUE, fig.width=7, fig.height=4, dpi=200}
+gg <- summary %>%
+  mutate(method = as.character(method)) %>%
+  filter(method %in% c("lasso", "alasso", "trlasso", "atrlasso")) %>%
+  mutate(method = factor(method, levels = c("lasso", "alasso", "trlasso", "atrlasso"))) %>%
+  split(., f = .$method) %>%
+  lapply(function(s) {
+    s %>%
+      ggplot(aes(x = n, y = l2_mean)) +
+      geom_point(aes(colour = region, shape = region), size = 1) +
+      geom_line(aes(colour = region, linetype = region)) +
+      geom_ribbon(aes(ymin = l2_mean - l2_se / 2, ymax = l2_mean + l2_se / 2, fill = region),
+                  alpha = 0.1) +
+      facet_wrap(~ method) +
+      scale_x_log10() + 
+      scale_y_log10(limits = c(0.0001, 1.05)) + 
+      theme(text = element_text(size = 6)) +
+      ylab("L2 Estimation Error") +
+      theme_bw()
+      })
+wrap_plots(gg)
+```
+
+## Active Selection
+
+```{r, cache=FALSE, autodep=TRUE, fig.width=7, fig.height=4, dpi=200}
+g <- results %>%
+  filter(method %in% c("lasso", "alasso", "trlasso", "atrlasso")) %>%
+  ggplot(aes(x = n, y = acc, shape = factor(i))) +
+  geom_line(aes(colour = region, linetype = region)) +
+  facet_wrap("method") +
+  scale_x_log10() + 
+  theme(text = element_text(size = 7))
+plot(g)
+ggplotly(g)
+```
+
+```{r, cache=FALSE, autodep=TRUE, fig.width=7, fig.height=4, dpi=200}
+gg <- summary %>%
+  mutate(method = as.character(method)) %>%
+  filter(method %in% c("lasso", "alasso", "trlasso", "atrlasso")) %>%
+  mutate(method = factor(method, levels = c("lasso", "alasso", "trlasso", "atrlasso"))) %>%
+  split(., f = .$method) %>%
+  lapply(function(s) {
+    s %>%
+      ggplot(aes(x = n, y = acc_mean)) +
+      geom_point(aes(colour = region, shape = region), size = 1) +
+      geom_line(aes(colour = region, linetype = region)) +
+      geom_ribbon(aes(ymin = acc_mean - acc_se / 2, ymax = acc_mean + acc_se / 2, fill = region),
+                  alpha = 0.1) +
+      facet_wrap(~ method) +
+      scale_x_log10() + 
+      theme(text = element_text(size = 6)) +
+      ylim(0, 1) +
+      ylab("Active Selection Ratio") +
+      theme_bw()
+      })
+wrap_plots(gg)
+```
+
+## Invariant Selection
+
+```{r, cache=FALSE, autodep=TRUE, fig.width=7, fig.height=4, dpi=200}
+g <- results %>%
+  filter(method %in% c("lasso", "alasso", "trlasso", "atrlasso")) %>%
+  ggplot(aes(x = n, y = inv_acc, shape = factor(i))) +
+  geom_line(aes(colour = region, linetype = region)) +
+  facet_wrap("method") +
+  scale_x_log10() + 
+  scale_y_log10() + 
+  theme(text = element_text(size = 7))
+plot(g)
+ggplotly(g)
+```
+
+```{r, cache=FALSE, autodep=TRUE, fig.width=7, fig.height=4, dpi=200}
+gg <- summary %>%
+  mutate(method = as.character(method)) %>%
+  filter(method %in% c("lasso", "alasso", "trlasso", "atrlasso")) %>%
+  mutate(method = factor(method, levels = c("lasso", "alasso", "trlasso", "atrlasso"))) %>%
+  split(., f = .$method) %>%
+  lapply(function(s) {
+    s %>%
+      ggplot(aes(x = n, y = inv_acc_mean)) +
+      geom_point(aes(colour = region, shape = region), size = 1) +
+      geom_line(aes(colour = region, linetype = region)) +
+      geom_ribbon(aes(ymin = inv_acc_mean - inv_acc_se / 2, ymax = inv_acc_mean + inv_acc_se / 2, fill = region),
+                  alpha = 0.1) +
+      facet_wrap(~ method) +
+      scale_x_log10() + 
+      theme(text = element_text(size = 6)) +
+      ylim(0, 1) +
+      ylab("Invariant Selection Ratio") +
+      theme_bw()
+      })
+wrap_plots(gg)
+```

@@ -1,0 +1,945 @@
+---
+title: "Simple Simulation for Adaptive Transfer Lasso"
+author: "Masaaki Takada"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    # toc_float: 
+    #   collapsed: true
+    #   smooth_scroll: true
+---
+
+#  Simulations
+
+OLS vs Lasso vs Adaptive Lasso vs Transfer Lasso vs Adaptive Transfer Lasso
+
+```{r, cache=FALSE, autodep=TRUE}
+library(MASS)
+library(Rcpp)
+library(tidyverse)
+library(trlasso)
+library(plotly)
+library(glmnet)
+```
+
+```{r, cache=TRUE, autodep=TRUE}
+source_setting <- "constant_size" # "same_data", "same_size", "constant_size"
+shift <- "no_shift" # "no_shift", "one_shift", "two_shift"
+
+r <- 0.5
+nfold <- 10
+n_source <- 10000 # active if source_setting is "constant_size"
+
+n_list <- c(10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000)
+p_list <- c(10, 20, 50, 100)
+sigma_list <- c(1, 3, 6, 10)
+num <- 10
+
+lambda_min_ratio <- 1e-6
+pf_max <- 1e3
+pf_min <- 1e-3
+pf_th <- 1e-3
+eps <- 1e-4
+
+summarise_result <- function(method, X_random, y_random, X_fixed, y_fixed, beta, beta_hat) {
+  nonzero <- (abs(beta) >= 1e-12)
+  nonzero_hat <- (abs(beta_hat) >= 1e-12)
+  tibble(
+    method = method,
+    rmse_random = sqrt(mean((y_random - X_random %*% beta_hat)^2)),
+    rmse_fixed = sqrt(mean((y_fixed - X_fixed %*% beta_hat)^2)),
+    l2 = sqrt(sum((beta_hat - beta)^2)),
+    sens = sum(nonzero_hat & nonzero) / max(sum(nonzero), 1),
+    spec = sum((!nonzero_hat) & (!nonzero)) / max(sum(!nonzero), 1),
+    ppv = sum(nonzero_hat & nonzero) / max(sum(nonzero_hat), 1),
+    fval = 2 / ((1/sens) + (1/ppv)),
+    num_nonzero = sum(nonzero_hat)
+    )
+}
+```
+
+```{r, cache=TRUE, autodep=TRUE}
+set.seed(0)
+
+results <- tibble()
+
+for (sigma in sigma_list) {
+  for (n in n_list) {
+    for ( p in p_list) {
+      for (i in 1:num) {
+        res <- tibble()
+        
+        # coefficient
+        beta <- c(c(3, 1.5, 0, 0, 2), rep(0, length=p-5))
+        beta_source <- switch(
+          shift,
+          "no_shift" = beta, # if shift=1
+          "one_shift" = c(c(3, 1.5, 0, 0, 2, 2), rep(0, length=p-6)), # if shift=2
+          "tow_shift" = c(c(3, 1.5, 0, 0, 0, 2), rep(0, length=p-6)) # if shift=3
+        )
+
+        # data
+        mu <- rep(0, length = p)
+        Sigma <- matrix(0, nrow = p, ncol = p)
+        for (j in 1:p) {
+          for (k in 1:p) {
+            Sigma[j, k] <- r^abs(j - k)
+          }
+        }
+        
+        # target data
+        X <- mvrnorm(n = n, mu = mu, Sigma = Sigma)
+        y <- X %*% beta + rnorm(n, mean = 0, sd = sigma)
+
+        # source data
+        if (source_setting == "same_data") {
+          n_source <- n
+          X_source <- X
+        } else if (source_setting == "same_size") {
+          n_source <- n
+          X_source <- mvrnorm(n = n_source, mu = mu, Sigma = Sigma)
+        } else if (source_setting == "constant_size") {
+          X_source <- mvrnorm(n = n_source, mu = mu, Sigma = Sigma)
+        } else {
+          stop("source_setting should be 'same_data', 'same_size', or 'constant_size'")
+        }
+        y_source <- X_source %*% beta_source + rnorm(n_source, mean = 0, sd = sigma)
+        
+        # test data (same X as target)
+        X_ts_fixed <- X
+        y_ts_fixed <- X_ts_fixed %*% beta + rnorm(n, mean = 0, sd = sigma)
+        
+        # test data (different X from target)
+        X_ts_random <- mvrnorm(n = n, mu = mu, Sigma = Sigma)
+        y_ts_random <- X_ts_random %*% beta + rnorm(n, mean = 0, sd = sigma)
+        
+        # cv setting
+        foldid <- rep(1:nfold, length=n)
+        foldid_source <- rep(1:nfold, length=n_source)
+        
+        # lasso with source data
+        cv_fit <- cv.trlasso(X_source, y_source, lambda.min.ratio = lambda_min_ratio, foldid = foldid_source, eps = eps)
+        beta_lasso_source <- cv_fit$fit$beta[, cv_fit$lambda.min.index]
+        res <- res %>%
+          bind_rows(summarise_result("lasso_source", X_ts_random, y_ts_random, X_ts_fixed, y_ts_fixed, beta, beta_lasso_source))
+
+        # ridge with source data
+        cv_fit <- cv.glmnet(X_source, y_source, alpha=0, lambda.min.ratio = lambda_min_ratio, foldid = foldid_source)
+        beta_ridge_source <- cv_fit$glmnet.fit$beta[, cv_fit$lambda == cv_fit$lambda.min]
+        res <- res %>%
+          bind_rows(summarise_result("ridge_source", X_ts_random, y_ts_random, X_ts_fixed, y_ts_fixed, beta, beta_ridge_source))
+
+        # lassoless with source data
+        fit <- trlasso(X_source, y_source, lambda = 1e-12, eps = eps)
+        beta_lassoless_source <- fit$beta[, 1]
+        res <- res %>%
+          bind_rows(summarise_result("lassoless_source", X_ts_random, y_ts_random, X_ts_fixed, y_ts_fixed, beta, beta_lassoless_source))
+
+        # ridgeless with source data
+        fit <- glmnet(X_source, y_source, lambda = 1e-12, alpha=0)
+        beta_ridgeless_source <- fit$beta[, 1]
+        res <- res %>%
+          bind_rows(summarise_result("ridgeless_source", X_ts_random, y_ts_random, X_ts_fixed, y_ts_fixed, beta, beta_ridgeless_source))
+        
+        # lasso
+        cv_fit <- cv.trlasso(X, y, lambda.min.ratio = lambda_min_ratio, foldid = foldid, eps = eps)
+        beta_lasso <- cv_fit$fit$beta[, cv_fit$lambda.min.index]
+        res <- res %>%
+          bind_rows(summarise_result("lasso", X_ts_random, y_ts_random, X_ts_fixed, y_ts_fixed, beta, beta_lasso))
+
+        # ridge
+        cv_fit <- cv.glmnet(X, y, alpha=0, lambda.min.ratio = lambda_min_ratio, foldid = foldid)
+        beta_ridge <- cv_fit$glmnet.fit$beta[, cv_fit$lambda == cv_fit$lambda.min]
+        res <- res %>%
+          bind_rows(summarise_result("ridge", X_ts_random, y_ts_random, X_ts_fixed, y_ts_fixed, beta, beta_ridge))
+
+        # lassoless
+        fit <- trlasso(X, y, lambda = 1e-12, eps = eps)
+        beta_lassoless <- fit$beta[, 1]
+        res <- res %>%
+          bind_rows(summarise_result("lassoless", X_ts_random, y_ts_random, X_ts_fixed, y_ts_fixed, beta, beta_lassoless))
+
+        # ridgeless
+        fit <- glmnet(X, y, lambda = 1e-12, alpha=0)
+        beta_ridgeless <- fit$beta[, 1]
+        res <- res %>%
+          bind_rows(summarise_result("ridgeless", X_ts_random, y_ts_random, X_ts_fixed, y_ts_fixed, beta, beta_ridgeless))
+        
+        # adaptive lasso with lasso
+        beta_tilde <- beta_lasso_source
+        pf_lasso_list <- list(
+          sapply(1/abs(beta_tilde)^(1/2), function(b){min(b, 1e6)}),
+          sapply(1/abs(beta_tilde)^(1), function(b){min(b, 1e6)}),
+          sapply(1/abs(beta_tilde)^(2), function(b){min(b, 1e6)})
+        )
+        cv_fit_list <- purrr::map(pf_lasso_list, function(pf_lasso) {
+          cv.trlasso(X, y, lambda.min.ratio = lambda_min_ratio, 
+                     penalty.factor.lasso = pf_lasso, 
+                     foldid = foldid,
+                     penalty.factor.thresh = pf_th, eps = eps)
+        })
+        alpha_min_index <- which.min(purrr::map(cv_fit_list, function(cv_fit) {
+          cv_fit$cve[cv_fit$lambda.min.index]
+        }))
+        cv_fit <- cv_fit_list[[alpha_min_index]]
+        beta_alasso_lasso <- cv_fit$fit$beta[, cv_fit$lambda.min.index]
+        res <- res %>%
+          bind_rows(summarise_result("alasso_lasso", X_ts_random, y_ts_random, X_ts_fixed, y_ts_fixed, beta, beta_alasso_lasso))
+
+        # adaptive lasso with ridge
+        beta_tilde <- beta_ridge_source
+        pf_lasso_list <- list(
+          sapply(1/abs(beta_tilde)^(1/2), function(b){max(min(b, pf_max), pf_min)}),
+          sapply(1/abs(beta_tilde)^1, function(b){max(min(b, pf_max), pf_min)}),
+          sapply(1/abs(beta_tilde)^2, function(b){max(min(b, pf_max), pf_min)})
+        )
+        cv_fit_list <- purrr::map(pf_lasso_list, function(pf_lasso) {
+          cv.trlasso(X, y, lambda.min.ratio = lambda_min_ratio, 
+                     penalty.factor.lasso = pf_lasso, 
+                     foldid = foldid,
+                     penalty.factor.thresh = pf_th, eps = eps)
+        })
+        alpha_min_index <- which.min(purrr::map(cv_fit_list, function(cv_fit) {
+          cv_fit$cve[cv_fit$lambda.min.index]
+        }))
+        cv_fit <- cv_fit_list[[alpha_min_index]]
+        beta_alasso_ridge <- cv_fit$fit$beta[, cv_fit$lambda.min.index]
+        res <- res %>%
+          bind_rows(summarise_result("alasso_ridge", X_ts_random, y_ts_random, X_ts_fixed, y_ts_fixed, beta, beta_alasso_ridge))
+        
+        # adaptive lasso with lassoless
+        beta_tilde <- beta_lassoless_source
+        pf_lasso_list <- list(
+          sapply(1/abs(beta_tilde)^(1/2), function(b){max(min(b, pf_max), pf_min)}),
+          sapply(1/abs(beta_tilde)^1, function(b){max(min(b, pf_max), pf_min)}),
+          sapply(1/abs(beta_tilde)^2, function(b){max(min(b, pf_max), pf_min)})
+        )
+        cv_fit_list <- purrr::map(pf_lasso_list, function(pf_lasso) {
+          cv.trlasso(X, y, lambda.min.ratio = lambda_min_ratio, 
+                     penalty.factor.lasso = pf_lasso, 
+                     foldid = foldid,
+                     penalty.factor.thresh = pf_th, eps = eps)
+        })
+        alpha_min_index <- which.min(purrr::map(cv_fit_list, function(cv_fit) {
+          cv_fit$cve[cv_fit$lambda.min.index]
+        }))
+        cv_fit <- cv_fit_list[[alpha_min_index]]
+        beta_alasso_lassoless <- cv_fit$fit$beta[, cv_fit$lambda.min.index]
+        res <- res %>%
+          bind_rows(summarise_result("alasso_lassoless", X_ts_random, y_ts_random, X_ts_fixed, y_ts_fixed, beta, beta_alasso_lassoless))
+        
+        # adaptive lasso with ridgeless
+        beta_tilde <- beta_ridgeless_source
+        pf_lasso_list <- list(
+          sapply(1/abs(beta_tilde)^(1/2), function(b){max(min(b, pf_max), pf_min)}),
+          sapply(1/abs(beta_tilde)^1, function(b){max(min(b, pf_max), pf_min)}),
+          sapply(1/abs(beta_tilde)^2, function(b){max(min(b, pf_max), pf_min)})
+        )
+        cv_fit_list <- purrr::map(pf_lasso_list, function(pf_lasso) {
+          cv.trlasso(X, y, lambda.min.ratio = lambda_min_ratio, 
+                     penalty.factor.lasso = pf_lasso, 
+                     foldid = foldid,
+                     penalty.factor.thresh = pf_th, eps = eps)
+        })
+        alpha_min_index <- which.min(purrr::map(cv_fit_list, function(cv_fit) {
+          cv_fit$cve[cv_fit$lambda.min.index]
+        }))
+        cv_fit <- cv_fit_list[[alpha_min_index]]
+        beta_alasso_ridgeless <- cv_fit$fit$beta[, cv_fit$lambda.min.index]
+        res <- res %>%
+          bind_rows(summarise_result("alasso_ridgeless", X_ts_random, y_ts_random, X_ts_fixed, y_ts_fixed, beta, beta_alasso_ridgeless))
+        
+        # transfer lasso with lasso
+        beta_tilde <- beta_lasso_source
+        alpha_list <- list(1/4, 1/2, 3/4)
+        cv_fit_list <- purrr::map(alpha_list, function(alpha) {
+          cv.trlasso(X, y, lambda.min.ratio = lambda_min_ratio, 
+                     beta_tilde = beta_tilde, alpha = alpha, 
+                     foldid = foldid,
+                     penalty.factor.thresh = pf_th, eps = eps)
+        })
+        alpha_min_index <- which.min(purrr::map(cv_fit_list, function(cv_fit) {
+          cv_fit$cve[cv_fit$lambda.min.index]
+        }))
+        cv_fit <- cv_fit_list[[alpha_min_index]]
+        beta_trlasso_lasso <- cv_fit$fit$beta[, cv_fit$lambda.min.index]
+        res <- res %>%
+          bind_rows(summarise_result("trlasso_lasso", X_ts_random, y_ts_random, X_ts_fixed, y_ts_fixed, beta, beta_trlasso_lasso))
+
+        # transfer lasso with ridge
+        beta_tilde <- beta_ridge_source
+        alpha_list <- list(1/4, 1/2, 3/4)
+        cv_fit_list <- purrr::map(alpha_list, function(alpha) {
+          cv.trlasso(X, y, lambda.min.ratio = lambda_min_ratio, 
+                     beta_tilde = beta_tilde, alpha = alpha, 
+                     foldid = foldid,
+                     penalty.factor.thresh = pf_th, eps = eps)
+        })
+        alpha_min_index <- which.min(purrr::map(cv_fit_list, function(cv_fit) {
+          cv_fit$cve[cv_fit$lambda.min.index]
+        }))
+        cv_fit <- cv_fit_list[[alpha_min_index]]
+        beta_trlasso_ridge <- cv_fit$fit$beta[, cv_fit$lambda.min.index]
+        res <- res %>%
+          bind_rows(summarise_result("trlasso_ridge", X_ts_random, y_ts_random, X_ts_fixed, y_ts_fixed, beta, beta_trlasso_ridge))
+
+        # transfer lasso with lassoless
+        beta_tilde <- beta_lassoless_source
+        alpha_list <- list(1/4, 1/2, 3/4)
+        cv_fit_list <- purrr::map(alpha_list, function(alpha) {
+          cv.trlasso(X, y, lambda.min.ratio = lambda_min_ratio, 
+                     beta_tilde = beta_tilde, alpha = alpha, 
+                     foldid = foldid,
+                     penalty.factor.thresh = pf_th, eps = eps)
+        })
+        alpha_min_index <- which.min(purrr::map(cv_fit_list, function(cv_fit) {
+          cv_fit$cve[cv_fit$lambda.min.index]
+        }))
+        cv_fit <- cv_fit_list[[alpha_min_index]]
+        beta_trlasso_lassoless <- cv_fit$fit$beta[, cv_fit$lambda.min.index]
+        res <- res %>%
+          bind_rows(summarise_result("trlasso_lassoless", X_ts_random, y_ts_random, X_ts_fixed, y_ts_fixed, beta, beta_trlasso_lassoless))
+
+        # transfer lasso with ridgeless
+        beta_tilde <- beta_ridgeless_source
+        alpha_list <- list(1/4, 1/2, 3/4)
+        cv_fit_list <- purrr::map(alpha_list, function(alpha) {
+          cv.trlasso(X, y, lambda.min.ratio = lambda_min_ratio, 
+                     beta_tilde = beta_tilde, alpha = alpha, 
+                     foldid = foldid,
+                     penalty.factor.thresh = pf_th, eps = eps)
+        })
+        alpha_min_index <- which.min(purrr::map(cv_fit_list, function(cv_fit) {
+          cv_fit$cve[cv_fit$lambda.min.index]
+        }))
+        cv_fit <- cv_fit_list[[alpha_min_index]]
+        beta_trlasso_ridgeless <- cv_fit$fit$beta[, cv_fit$lambda.min.index]
+        res <- res %>%
+          bind_rows(summarise_result("trlasso_ridgeless", X_ts_random, y_ts_random, X_ts_fixed, y_ts_fixed, beta, beta_trlasso_ridgeless))
+
+        # adaptive transfer lasso with lasso
+        beta_tilde <- beta_lasso_source
+        alpha_list <- list(1/4, 1/2, 3/4)
+        pf_lasso_list <- list(
+          sapply(1/abs(beta_tilde)^(1/2), function(b){max(min(b, pf_max), pf_min)}),
+          sapply(1/abs(beta_tilde)^1, function(b){max(min(b, pf_max), pf_min)}),
+          sapply(1/abs(beta_tilde)^2, function(b){max(min(b, pf_max), pf_min)})
+        )
+        pf_trlasso_list <- list(
+          sapply(abs(beta_tilde)^(1/2), function(b){max(min(b, pf_max), pf_min)}),
+          sapply(abs(beta_tilde)^1, function(b){max(min(b, pf_max), pf_min)}),
+          sapply(abs(beta_tilde)^2, function(b){max(min(b, pf_max), pf_min)})
+        )
+        pf_df <- tibble(
+          pf_lasso_list,
+          pf_trlasso_list
+        )
+        cv_fit_list_list <- purrr::map(alpha_list, function(alpha) {
+          purrr::map2(pf_lasso_list, pf_trlasso_list, 
+                      function(pf_lasso, pf_trlasso) {
+                        cv.trlasso(X, y, lambda.min.ratio = lambda_min_ratio, 
+                        beta_tilde = beta_tilde, alpha = alpha, 
+                        penalty.factor.lasso = pf_lasso,
+                        penalty.factor.trlasso = pf_trlasso, 
+                        foldid = foldid,
+                        penalty.factor.thresh = pf_th, eps = eps)
+          })
+        })
+        alpha_min_index <- which.min(purrr::map(cv_fit_list_list, function(cv_fit_list) {
+          purrr::map_dbl(cv_fit_list, function(cv_fit) {
+            cv_fit$cve[cv_fit$lambda.min.index]
+          }) %>% min()
+        }))
+        cv_fit_list <- cv_fit_list_list[[alpha_min_index]]
+        pf_min_index <- which.min(purrr::map(cv_fit_list, function(cv_fit) {
+          cv_fit$cve[cv_fit$lambda.min.index]
+        }))
+        cv_fit <- cv_fit_list[[pf_min_index]]
+        beta_atrlasso_lasso <- cv_fit$fit$beta[, cv_fit$lambda.min.index]
+        res <- res %>%
+          bind_rows(summarise_result("atrlasso_lasso", X_ts_random, y_ts_random, X_ts_fixed, y_ts_fixed, beta, beta_atrlasso_lasso))
+        
+        # adaptive transfer lasso with ridge
+        beta_tilde <- beta_ridge_source
+        alpha_list <- list(1/4, 1/2, 3/4)
+        pf_lasso_list <- list(
+          sapply(1/abs(beta_tilde)^(1/2), function(b){max(min(b, pf_max), pf_min)}),
+          sapply(1/abs(beta_tilde)^1, function(b){max(min(b, pf_max), pf_min)}),
+          sapply(1/abs(beta_tilde)^2, function(b){max(min(b, pf_max), pf_min)})
+        )
+        pf_trlasso_list <- list(
+          sapply(abs(beta_tilde)^(1/2), function(b){max(min(b, pf_max), pf_min)}),
+          sapply(abs(beta_tilde)^1, function(b){max(min(b, pf_max), pf_min)}),
+          sapply(abs(beta_tilde)^2, function(b){max(min(b, pf_max), pf_min)})
+        )
+        pf_df <- tibble(
+          pf_lasso_list,
+          pf_trlasso_list
+        )
+        cv_fit_list_list <- purrr::map(alpha_list, function(alpha) {
+          purrr::map2(pf_lasso_list, pf_trlasso_list, 
+                      function(pf_lasso, pf_trlasso) {
+                        cv.trlasso(X, y, lambda.min.ratio = lambda_min_ratio, 
+                        beta_tilde = beta_tilde, alpha = alpha, 
+                        penalty.factor.lasso = pf_lasso,
+                        penalty.factor.trlasso = pf_trlasso, 
+                        foldid = foldid,
+                        penalty.factor.thresh = pf_th, eps = eps)
+          })
+        })
+        alpha_min_index <- which.min(purrr::map(cv_fit_list_list, function(cv_fit_list) {
+          purrr::map_dbl(cv_fit_list, function(cv_fit) {
+            cv_fit$cve[cv_fit$lambda.min.index]
+          }) %>% min()
+        }))
+        cv_fit_list <- cv_fit_list_list[[alpha_min_index]]
+        pf_min_index <- which.min(purrr::map(cv_fit_list, function(cv_fit) {
+          cv_fit$cve[cv_fit$lambda.min.index]
+        }))
+        cv_fit <- cv_fit_list[[pf_min_index]]
+        beta_atrlasso_ridge <- cv_fit$fit$beta[, cv_fit$lambda.min.index]
+        res <- res %>%
+          bind_rows(summarise_result("atrlasso_ridge", X_ts_random, y_ts_random, X_ts_fixed, y_ts_fixed, beta, beta_atrlasso_ridge))
+        
+        # adaptive transfer lasso with lassoless
+        beta_tilde <- beta_lassoless_source
+        alpha_list <- list(1/4, 1/2, 3/4)
+        pf_lasso_list <- list(
+          sapply(1/abs(beta_tilde)^(1/2), function(b){max(min(b, pf_max), pf_min)}),
+          sapply(1/abs(beta_tilde)^1, function(b){max(min(b, pf_max), pf_min)}),
+          sapply(1/abs(beta_tilde)^2, function(b){max(min(b, pf_max), pf_min)})
+        )
+        pf_trlasso_list <- list(
+          sapply(abs(beta_tilde)^(1/2), function(b){max(min(b, pf_max), pf_min)}),
+          sapply(abs(beta_tilde)^1, function(b){max(min(b, pf_max), pf_min)}),
+          sapply(abs(beta_tilde)^2, function(b){max(min(b, pf_max), pf_min)})
+        )
+        pf_df <- tibble(
+          pf_lasso_list,
+          pf_trlasso_list
+        )
+        cv_fit_list_list <- purrr::map(alpha_list, function(alpha) {
+          purrr::map2(pf_lasso_list, pf_trlasso_list, 
+                      function(pf_lasso, pf_trlasso) {
+                        cv.trlasso(X, y, lambda.min.ratio = lambda_min_ratio, 
+                        beta_tilde = beta_tilde, alpha = alpha, 
+                        penalty.factor.lasso = pf_lasso,
+                        penalty.factor.trlasso = pf_trlasso, 
+                        foldid = foldid,
+                        penalty.factor.thresh = pf_th, eps = eps)
+          })
+        })
+        alpha_min_index <- which.min(purrr::map(cv_fit_list_list, function(cv_fit_list) {
+          purrr::map_dbl(cv_fit_list, function(cv_fit) {
+            cv_fit$cve[cv_fit$lambda.min.index]
+          }) %>% min()
+        }))
+        cv_fit_list <- cv_fit_list_list[[alpha_min_index]]
+        pf_min_index <- which.min(purrr::map(cv_fit_list, function(cv_fit) {
+          cv_fit$cve[cv_fit$lambda.min.index]
+        }))
+        cv_fit <- cv_fit_list[[pf_min_index]]
+        beta_atrlasso_lassoless <- cv_fit$fit$beta[, cv_fit$lambda.min.index]
+        res <- res %>%
+          bind_rows(summarise_result("atrlasso_lassoless", X_ts_random, y_ts_random, X_ts_fixed, y_ts_fixed, beta, beta_atrlasso_lassoless))
+        
+        # adaptive transfer lasso with ridge
+        beta_tilde <- beta_ridgeless_source
+        alpha_list <- list(1/4, 1/2, 3/4)
+        pf_lasso_list <- list(
+          sapply(1/abs(beta_tilde)^(1/2), function(b){max(min(b, pf_max), pf_min)}),
+          sapply(1/abs(beta_tilde)^1, function(b){max(min(b, pf_max), pf_min)}),
+          sapply(1/abs(beta_tilde)^2, function(b){max(min(b, pf_max), pf_min)})
+        )
+        pf_trlasso_list <- list(
+          sapply(abs(beta_tilde)^(1/2), function(b){max(min(b, pf_max), pf_min)}),
+          sapply(abs(beta_tilde)^1, function(b){max(min(b, pf_max), pf_min)}),
+          sapply(abs(beta_tilde)^2, function(b){max(min(b, pf_max), pf_min)})
+        )
+        pf_df <- tibble(
+          pf_lasso_list,
+          pf_trlasso_list
+        )
+        cv_fit_list_list <- purrr::map(alpha_list, function(alpha) {
+          purrr::map2(pf_lasso_list, pf_trlasso_list, 
+                      function(pf_lasso, pf_trlasso) {
+                        cv.trlasso(X, y, lambda.min.ratio = lambda_min_ratio, 
+                        beta_tilde = beta_tilde, alpha = alpha, 
+                        penalty.factor.lasso = pf_lasso,
+                        penalty.factor.trlasso = pf_trlasso, 
+                        foldid = foldid,
+                        penalty.factor.thresh = pf_th, eps = eps)
+          })
+        })
+        alpha_min_index <- which.min(purrr::map(cv_fit_list_list, function(cv_fit_list) {
+          purrr::map_dbl(cv_fit_list, function(cv_fit) {
+            cv_fit$cve[cv_fit$lambda.min.index]
+          }) %>% min()
+        }))
+        cv_fit_list <- cv_fit_list_list[[alpha_min_index]]
+        pf_min_index <- which.min(purrr::map(cv_fit_list, function(cv_fit) {
+          cv_fit$cve[cv_fit$lambda.min.index]
+        }))
+        cv_fit <- cv_fit_list[[pf_min_index]]
+        beta_atrlasso_ridgeless <- cv_fit$fit$beta[, cv_fit$lambda.min.index]
+        res <- res %>%
+          bind_rows(summarise_result("atrlasso_ridgeless", X_ts_random, y_ts_random, X_ts_fixed, y_ts_fixed, beta, beta_atrlasso_ridgeless))
+
+          results <- results %>%
+          bind_rows(tibble(
+            res %>%
+              dplyr::mutate(
+                i = i,
+                n = n,
+                p = p,
+                sigma = sigma
+                )
+            ))
+      }
+    }
+  }
+}
+```
+
+# Summary
+```{r, cache=FALSE, autodep=TRUE}
+summary <- results %>%
+  dplyr::select(-i) %>%
+  dplyr::group_by(method, n, p, sigma) %>%
+  dplyr::summarise_all(list(mean = ~ mean(., na.rm = TRUE), se = ~ sd(., na.rm = TRUE) / sqrt(n()))) %>%
+  dplyr::mutate(method = factor(method, levels = c(
+    paste0(c("lasso", "ridge", "lassoless", "ridgeless"), "_source"),
+    c("lasso", "ridge", "lassoless", "ridgeless"),
+    paste0("alasso_", c("lasso", "ridge", "lassoless", "ridgeless")),
+    paste0("trlasso_", c("lasso", "ridge", "lassoless", "ridgeless")),
+    paste0("atrlasso_", c("lasso", "ridge", "lassoless", "ridgeless"))
+  )))
+
+DT::datatable(summary)
+
+summary <- summary %>%
+  dplyr::mutate(p_level = factor(paste0("p=", p), levels = paste0("p=", p_list))) %>%
+  dplyr::mutate(sigma_level = factor(paste0("sigma=", sigma), levels = paste0("sigma=", sigma_list)))
+```
+
+# Prediction RMSE
+
+## Random X
+```{r, cache=FALSE, autodep=TRUE, fig.width=7, fig.height=4, dpi=200}
+g <- summary %>%
+  ggplot(aes(x = n, y = rmse_random_mean, 
+             color = method, linetype = method, fill = method)) +
+  geom_line() +
+  geom_ribbon(aes(ymin = rmse_random_mean - rmse_random_se / 2, 
+                  ymax = rmse_random_mean + rmse_random_se / 2), 
+              alpha = 0.1) +
+  facet_grid(sigma_level ~ p_level, scales="free_y") +
+  scale_x_log10(breaks = n_list) + 
+  theme(text = element_text(size = 7))
+ggplotly(g, dynamicTicks = "y")
+```
+
+```{r, cache=FALSE, autodep=TRUE, fig.width=7, fig.height=4, dpi=300}
+target_method <- c("lasso", "alasso_lasso", "trlasso_lasso", "atrlasso_lasso")
+g <- summary %>%
+  filter(method %in% target_method) %>%
+  mutate(method = str_remove(method, "_lasso") %>%
+           factor(levels = str_remove(target_method, "_lasso"))) %>%
+  ggplot(aes(x = n, y = rmse_random_mean)) +
+  geom_line(aes(color = method, linetype = method)) +
+  geom_ribbon(aes(ymin = rmse_random_mean - rmse_random_se / 2, 
+                  ymax = rmse_random_mean + rmse_random_se / 2,
+                  fill = method), 
+              alpha = 0.2) +
+  facet_grid(sigma_level ~ p_level, scales="free_y") +
+  scale_x_log10(breaks = c(10, 100, 1000, 10000),
+                minor_breaks = n_list,
+                labels = scales::trans_format("log10", scales::math_format(10^.x))) + 
+  theme(text = element_text(size = 7)) +
+  ylab("RMSE") +
+  theme_bw()
+plot(g)
+```
+
+## Fixed X
+```{r, cache=FALSE, autodep=TRUE, fig.width=7, fig.height=4, dpi=200}
+g <- summary %>%
+  ggplot(aes(x = n, y = rmse_fixed_mean, 
+             color = method, linetype = method, fill = method)) +
+  geom_line() +
+  geom_ribbon(aes(ymin = rmse_fixed_mean - rmse_fixed_se / 2, 
+                  ymax = rmse_fixed_mean + rmse_fixed_se / 2), 
+              alpha = 0.1) +
+  facet_grid(sigma_level ~ p_level, scales="free_y") +
+  scale_x_log10(breaks = n_list) + 
+  theme(text = element_text(size = 7))
+ggplotly(g, dynamicTicks = "y")
+```
+
+```{r, cache=FALSE, autodep=TRUE, fig.width=7, fig.height=4, dpi=300}
+target_method <- c("lasso", "alasso_lasso", "trlasso_lasso", "atrlasso_lasso")
+g <- summary %>%
+  filter(method %in% target_method) %>%
+  mutate(method = str_remove(method, "_lasso") %>%
+           factor(levels = str_remove(target_method, "_lasso"))) %>%
+  ggplot(aes(x = n, y = rmse_fixed_mean)) +
+  geom_line(aes(color = method, linetype = method)) +
+  geom_ribbon(aes(ymin = rmse_fixed_mean - rmse_fixed_se / 2, 
+                  ymax = rmse_fixed_mean + rmse_fixed_se / 2,
+                  fill = method), 
+              alpha = 0.2) +
+  facet_grid(sigma_level ~ p_level, scales="free_y") +
+  scale_x_log10(breaks = c(10, 100, 1000, 10000),
+                minor_breaks = n_list,
+                labels = scales::trans_format("log10", scales::math_format(10^.x))) + 
+  theme(text = element_text(size = 7)) +
+  ylab("RMSE") +
+  theme_bw()
+plot(g)
+```
+
+# Estimation L2 Error
+
+```{r, cache=FALSE, autodep=TRUE, fig.width=7, fig.height=4, dpi=200}
+g <- summary %>%
+  ggplot(aes(x = n, y = l2_mean, ymin = l2_mean - l2_se / 2, ymax = l2_mean + l2_se / 2,
+             colour = method, fill = method, linetype = method)) +
+  geom_line() +
+  geom_ribbon(alpha = 0.1) +
+  facet_grid(sigma_level ~ p_level, scales="free_y") +
+  scale_x_log10(breaks = n_list) + 
+  theme(text = element_text(size = 7))
+ggplotly(g, dynamicTicks = "y")
+```
+
+```{r, cache=FALSE, autodep=TRUE, fig.width=7, fig.height=4, dpi=300}
+target_method <- c("lasso", "alasso_lasso", "trlasso_lasso", "atrlasso_lasso")
+g <- summary %>%
+  filter(method %in% target_method) %>%
+  mutate(method = str_remove(method, "_lasso") %>%
+           factor(levels = str_remove(target_method, "_lasso"))) %>%
+  ggplot(aes(x = n, y = l2_mean)) +
+  geom_line(aes(color = method, linetype = method)) +
+  geom_ribbon(aes(ymin = l2_mean - l2_se / 2, 
+                  ymax = l2_mean + l2_se / 2,
+                  fill = method), 
+              alpha = 0.2) +
+  facet_grid(sigma_level ~ p_level, scales="free_y") +
+  scale_x_log10(breaks = c(10, 100, 1000, 10000),
+                minor_breaks = n_list,
+                labels = scales::trans_format("log10", scales::math_format(10^.x))) + 
+  theme(text = element_text(size = 7)) +
+  ylab("L2 Estimation Error") +
+  theme_bw()
+plot(g)
+```
+
+```{r, cache=FALSE, autodep=TRUE, fig.width=7, fig.height=4, dpi=300}
+target_method <- c("ridge", "alasso_ridge", "trlasso_ridge", "atrlasso_ridge")
+g <- summary %>%
+  filter(method %in% target_method) %>%
+  mutate(method = str_remove(method, "_ridge") %>%
+           factor(levels = str_remove(target_method, "_ridge"))) %>%
+  ggplot(aes(x = n, y = l2_mean)) +
+  geom_line(aes(color = method, linetype = method)) +
+  geom_ribbon(aes(ymin = l2_mean - l2_se / 2, 
+                  ymax = l2_mean + l2_se / 2,
+                  fill = method), 
+              alpha = 0.2) +
+  facet_grid(sigma_level ~ p_level, scales="free_y") +
+  scale_x_log10(breaks = c(10, 100, 1000, 10000),
+                minor_breaks = n_list,
+                labels = scales::trans_format("log10", scales::math_format(10^.x))) + 
+  theme(text = element_text(size = 7)) +
+  ylab("L2 Estimation Error") +
+  theme_bw()
+plot(g)
+```
+
+```{r, cache=FALSE, autodep=TRUE, fig.width=7, fig.height=4, dpi=300}
+target_method <- c("ridgeless", "alasso_ridgeless", "trlasso_ridgeless", "atrlasso_ridgeless")
+g <- summary %>%
+  filter(method %in% target_method) %>%
+  mutate(method = str_remove(method, "_ridgeless") %>%
+           factor(levels = str_remove(target_method, "_ridgeless"))) %>%
+  ggplot(aes(x = n, y = l2_mean)) +
+  geom_line(aes(color = method, linetype = method)) +
+  geom_ribbon(aes(ymin = l2_mean - l2_se / 2, 
+                  ymax = l2_mean + l2_se / 2,
+                  fill = method), 
+              alpha = 0.2) +
+  facet_grid(sigma_level ~ p_level, scales="free_y") +
+  scale_x_log10(breaks = c(10, 100, 1000, 10000),
+                minor_breaks = n_list,
+                labels = scales::trans_format("log10", scales::math_format(10^.x))) + 
+  theme(text = element_text(size = 7)) +
+  ylab("L2 Estimation Error") +
+  theme_bw()
+plot(g)
+```
+
+```{r, cache=FALSE, autodep=TRUE, fig.width=7, fig.height=4, dpi=300}
+target_method <- c("lassoless", "alasso_lassoless", "trlasso_lassoless", "atrlasso_lassoless")
+g <- summary %>%
+  filter(method %in% target_method) %>%
+  mutate(method = str_remove(method, "_lassoless") %>%
+           factor(levels = str_remove(target_method, "_lassoless"))) %>%
+  ggplot(aes(x = n, y = l2_mean)) +
+  geom_line(aes(color = method, linetype = method)) +
+  geom_ribbon(aes(ymin = l2_mean - l2_se / 2, 
+                  ymax = l2_mean + l2_se / 2,
+                  fill = method), 
+              alpha = 0.2) +
+  facet_grid(sigma_level ~ p_level, scales="free_y") +
+  scale_x_log10(breaks = c(10, 100, 1000, 10000),
+                minor_breaks = n_list,
+                labels = scales::trans_format("log10", scales::math_format(10^.x))) + 
+  theme(text = element_text(size = 7)) +
+  ylab("L2 Estimation Error") +
+  theme_bw()
+plot(g)
+```
+# Feature Selection
+
+## F-Value
+```{r, cache=FALSE, autodep=TRUE, fig.width=7, fig.height=4, dpi=200}
+g <- summary %>%
+  ggplot(aes(x = n, y = fval_mean, ymin = fval_mean - fval_se / 2, ymax = fval_mean + fval_se / 2,
+             colour = method, fill = method, linetype = method)) +
+  geom_line() +
+  geom_ribbon(alpha = 0.1) +
+  facet_grid(sigma_level ~ p_level, scales="free_y") +
+  scale_x_log10(breaks = n_list) + 
+  theme(text = element_text(size = 7))
+ggplotly(g, dynamicTicks = "y")
+```
+
+```{r, cache=FALSE, autodep=TRUE, fig.width=7, fig.height=4, dpi=300}
+target_method <- c("lasso", "alasso_lasso", "trlasso_lasso", "atrlasso_lasso")
+g <- summary %>%
+  filter(method %in% target_method) %>%
+  mutate(method = str_remove(method, "_lasso") %>%
+           factor(levels = str_remove(target_method, "_lasso"))) %>%
+  ggplot(aes(x = n, y = fval_mean)) +
+  geom_line(aes(color = method, linetype = method)) +
+  geom_ribbon(aes(ymin = fval_mean - fval_se / 2, 
+                  ymax = fval_mean + fval_se / 2,
+                  fill = method), 
+              alpha = 0.2) +
+  facet_grid(sigma_level ~ p_level, scales="free_y") +
+  scale_x_log10(breaks = c(10, 100, 1000, 10000),
+                minor_breaks = n_list,
+                labels = scales::trans_format("log10", scales::math_format(10^.x))) + 
+  theme(text = element_text(size = 7)) +
+  ylab("F1 Variable Selection") +
+  theme_bw()
+plot(g)
+```
+
+```{r, cache=FALSE, autodep=TRUE, fig.width=7, fig.height=4, dpi=300}
+target_method <- c("ridge", "alasso_ridge", "trlasso_ridge", "atrlasso_ridge")
+g <- summary %>%
+  filter(method %in% target_method) %>%
+  mutate(method = str_remove(method, "_ridge") %>%
+           factor(levels = str_remove(target_method, "_ridge"))) %>%
+  ggplot(aes(x = n, y = fval_mean)) +
+  geom_line(aes(color = method, linetype = method)) +
+  geom_ribbon(aes(ymin = fval_mean - fval_se / 2, 
+                  ymax = fval_mean + fval_se / 2,
+                  fill = method), 
+              alpha = 0.2) +
+  facet_grid(sigma_level ~ p_level, scales="free_y") +
+  scale_x_log10(breaks = c(10, 100, 1000, 10000),
+                minor_breaks = n_list,
+                labels = scales::trans_format("log10", scales::math_format(10^.x))) + 
+  theme(text = element_text(size = 7)) +
+  ylab("F1 Variable Selection") +
+  theme_bw()
+plot(g)
+```
+
+```{r, cache=FALSE, autodep=TRUE, fig.width=7, fig.height=4, dpi=300}
+target_method <- c("ridgeless", "alasso_ridgeless", "trlasso_ridgeless", "atrlasso_ridgeless")
+g <- summary %>%
+  filter(method %in% target_method) %>%
+  mutate(method = str_remove(method, "_ridgeless") %>%
+           factor(levels = str_remove(target_method, "_ridgeless"))) %>%
+  ggplot(aes(x = n, y = fval_mean)) +
+  geom_line(aes(color = method, linetype = method)) +
+  geom_ribbon(aes(ymin = fval_mean - fval_se / 2, 
+                  ymax = fval_mean + fval_se / 2,
+                  fill = method), 
+              alpha = 0.2) +
+  facet_grid(sigma_level ~ p_level, scales="free_y") +
+  scale_x_log10(breaks = c(10, 100, 1000, 10000),
+                minor_breaks = n_list,
+                labels = scales::trans_format("log10", scales::math_format(10^.x))) + 
+  theme(text = element_text(size = 7)) +
+  ylab("F1 Variable Selection") +
+  theme_bw()
+plot(g)
+```
+
+```{r, cache=FALSE, autodep=TRUE, fig.width=7, fig.height=4, dpi=300}
+target_method <- c("lassoless", "alasso_lassoless", "trlasso_lassoless", "atrlasso_lassoless")
+g <- summary %>%
+  filter(method %in% target_method) %>%
+  mutate(method = str_remove(method, "_lassoless") %>%
+           factor(levels = str_remove(target_method, "_lassoless"))) %>%
+  ggplot(aes(x = n, y = fval_mean)) +
+  geom_line(aes(color = method, linetype = method)) +
+  geom_ribbon(aes(ymin = fval_mean - fval_se / 2, 
+                  ymax = fval_mean + fval_se / 2,
+                  fill = method), 
+              alpha = 0.2) +
+  facet_grid(sigma_level ~ p_level, scales="free_y") +
+  scale_x_log10(breaks = c(10, 100, 1000, 10000),
+                minor_breaks = n_list,
+                labels = scales::trans_format("log10", scales::math_format(10^.x))) + 
+  theme(text = element_text(size = 7)) +
+  ylab("F1 Variable Selection") +
+  theme_bw()
+plot(g)
+```
+
+## Sensitivity
+```{r, cache=FALSE, autodep=TRUE, fig.width=7, fig.height=4, dpi=200}
+g <- summary %>%
+  ggplot(aes(x = n, y = sens_mean, ymin = sens_mean - sens_se / 2, ymax = sens_mean + sens_se / 2,
+             colour = method, fill = method, linetype = method)) +
+  geom_line() +
+  geom_ribbon(alpha = 0.1) +
+  facet_grid(sigma_level ~ p_level, scales="free_y") +
+  scale_x_log10(breaks = n_list) + 
+  theme(text = element_text(size = 7))
+ggplotly(g, dynamicTicks = "y")
+```
+
+```{r, cache=FALSE, autodep=TRUE, fig.width=7, fig.height=4, dpi=300}
+target_method <- c("lasso", "alasso_lasso", "trlasso_lasso", "atrlasso_lasso")
+g <- summary %>%
+  filter(method %in% target_method) %>%
+  mutate(method = str_remove(method, "_lasso") %>%
+           factor(levels = str_remove(target_method, "_lasso"))) %>%
+  ggplot(aes(x = n, y = sens_mean)) +
+  geom_line(aes(color = method, linetype = method)) +
+  geom_ribbon(aes(ymin = sens_mean - sens_se / 2, 
+                  ymax = sens_mean + sens_se / 2,
+                  fill = method), 
+              alpha = 0.2) +
+  facet_grid(sigma_level ~ p_level, scales="free_y") +
+  scale_x_log10(breaks = c(10, 100, 1000, 10000),
+                minor_breaks = n_list,
+                labels = scales::trans_format("log10", scales::math_format(10^.x))) + 
+  theme(text = element_text(size = 7)) +
+  ylab("Sensitivity") +
+  theme_bw()
+plot(g)
+```
+
+## Specificity
+```{r, cache=FALSE, autodep=TRUE, fig.width=7, fig.height=4, dpi=200}
+g <- summary %>%
+  ggplot(aes(x = n, y = spec_mean, ymin = spec_mean - spec_se / 2, ymax = spec_mean + spec_se / 2,
+             colour = method, fill = method, linetype = method)) +
+  geom_line() +
+  geom_ribbon(alpha = 0.1) +
+  facet_grid(sigma_level ~ p_level, scales="free_y") +
+  scale_x_log10(breaks = n_list) + 
+  theme(text = element_text(size = 7))
+ggplotly(g, dynamicTicks = "y")
+```
+
+```{r, cache=FALSE, autodep=TRUE, fig.width=7, fig.height=4, dpi=300}
+target_method <- c("lasso", "alasso_lasso", "trlasso_lasso", "atrlasso_lasso")
+g <- summary %>%
+  filter(method %in% target_method) %>%
+  mutate(method = str_remove(method, "_lasso") %>%
+           factor(levels = str_remove(target_method, "_lasso"))) %>%
+  ggplot(aes(x = n, y = spec_mean)) +
+  geom_line(aes(color = method, linetype = method)) +
+  geom_ribbon(aes(ymin = spec_mean - spec_se / 2, 
+                  ymax = spec_mean + spec_se / 2,
+                  fill = method), 
+              alpha = 0.2) +
+  facet_grid(sigma_level ~ p_level, scales="free_y") +
+  scale_x_log10(breaks = c(10, 100, 1000, 10000),
+                minor_breaks = n_list,
+                labels = scales::trans_format("log10", scales::math_format(10^.x))) + 
+  theme(text = element_text(size = 7)) +
+  ylab("Specificity") +
+  theme_bw()
+plot(g)
+```
+
+## Positive Predictive Value
+```{r, cache=FALSE, autodep=TRUE, fig.width=7, fig.height=4, dpi=200}
+g <- summary %>%
+  ggplot(aes(x = n, y = ppv_mean, ymin = ppv_mean - ppv_se / 2, ymax = ppv_mean + ppv_se / 2,
+             colour = method, fill = method, linetype = method)) +
+  geom_line() +
+  geom_ribbon(alpha = 0.1) +
+  facet_grid(sigma_level ~ p_level, scales="free_y") +
+  scale_x_log10(breaks = n_list) + 
+  theme(text = element_text(size = 7))
+ggplotly(g, dynamicTicks = "y")
+```
+
+```{r, cache=FALSE, autodep=TRUE, fig.width=7, fig.height=4, dpi=300}
+target_method <- c("lasso", "alasso_lasso", "trlasso_lasso", "atrlasso_lasso")
+g <- summary %>%
+  filter(method %in% target_method) %>%
+  mutate(method = str_remove(method, "_lasso") %>%
+           factor(levels = str_remove(target_method, "_lasso"))) %>%
+  ggplot(aes(x = n, y = ppv_mean)) +
+  geom_line(aes(color = method, linetype = method)) +
+  geom_ribbon(aes(ymin = ppv_mean - ppv_se / 2, 
+                  ymax = ppv_mean + ppv_se / 2,
+                  fill = method), 
+              alpha = 0.2) +
+  facet_grid(sigma_level ~ p_level, scales="free_y") +
+  scale_x_log10(breaks = c(10, 100, 1000, 10000),
+                minor_breaks = n_list,
+                labels = scales::trans_format("log10", scales::math_format(10^.x))) + 
+  theme(text = element_text(size = 7)) +
+  ylab("Positive Predictive Value") +
+  theme_bw()
+plot(g)
+```
+
+## Number of Active Variables
+```{r, cache=FALSE, autodep=TRUE, fig.width=7, fig.height=4, dpi=200}
+g <- summary %>%
+  ggplot(aes(x = n, y = num_nonzero_mean, ymin = num_nonzero_mean - num_nonzero_se / 2, ymax = num_nonzero_mean + num_nonzero_se / 2,
+             colour = method, fill = method, linetype = method)) +
+  geom_line() +
+  geom_ribbon(alpha = 0.1) +
+  facet_grid(sigma_level ~ p_level, scales="free_y") +
+  scale_x_log10(breaks = n_list) + 
+  theme(text = element_text(size = 7))
+ggplotly(g, dynamicTicks = "y")
+```
+
+```{r, cache=FALSE, autodep=TRUE, fig.width=7, fig.height=4, dpi=300}
+target_method <- c("lasso", "alasso_lasso", "trlasso_lasso", "atrlasso_lasso")
+g <- summary %>%
+  filter(method %in% target_method) %>%
+  mutate(method = str_remove(method, "_lasso") %>%
+           factor(levels = str_remove(target_method, "_lasso"))) %>%
+  ggplot(aes(x = n, y = num_nonzero_se)) +
+  geom_line(aes(color = method, linetype = method)) +
+  geom_ribbon(aes(ymin = num_nonzero_se - num_nonzero_se / 2, 
+                  ymax = num_nonzero_se + num_nonzero_se / 2,
+                  fill = method), 
+              alpha = 0.2) +
+  facet_grid(sigma_level ~ p_level, scales="free_y") +
+  scale_x_log10(breaks = c(10, 100, 1000, 10000),
+                minor_breaks = n_list,
+                labels = scales::trans_format("log10", scales::math_format(10^.x))) + 
+  theme(text = element_text(size = 7)) +
+  ylab("Number of Active Variables") +
+  theme_bw()
+plot(g)
+```

@@ -1,0 +1,63 @@
+---
+title: "A Simple Example for Linear Transfer Lasso"
+author: "Masaaki Takada"
+date: "`r Sys.Date()`"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{A Sample Example for Linear Transfer Lasso}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+
+## Transfer Lasso
+
+This is a simple example for linear Transfer Lasso.
+Transfer Lasso for linear models is given by
+$\hat{\beta} = \arg\min_\beta \left\{ \| y - X \beta \|_2^2 + \lambda \left( \alpha \| \beta \|_1 + (1 - \alpha) \| \beta - \tilde{\beta} \|_1 \right) \right\}$.
+
+```{r, echo=TRUE, results='asis'}
+library(trlasso)
+# source("../R/lasso.R")
+# source("../R/cross_validator.R")
+# source("../R/predictor.R")
+# source("../R/plotter.R")
+# sourceCpp("../src/cda.cpp")
+
+n <- 50
+p <- 100
+
+set.seed(1234)
+
+# data 1
+X1 <- matrix(rnorm(n*p, mean=0, sd=1), nrow=n, ncol=p)
+b1 <- c(2, 1, rep(0, length=p-2))
+y1 <- X1 %*% b1 + rnorm(n)
+
+# data 2
+X2 <- matrix(rnorm(n*p, mean=0, sd=1), nrow=n, ncol=p)
+b2 <- c(2, 2, rep(0, length=p-2))
+y2 <- X2 %*% b2 + rnorm(n)
+
+# ordinary lasso for data 1
+cvfit1 <- cv.trlasso(X1, y1, alpha=1) # alpha=1 means ordinary lasso
+plot(cvfit1) # plot cross-validation curve
+plot(cvfit1$fit) # plot solution path
+
+# transfer lasso for data 2
+b_tilde <- cvfit1$fit$beta[, cvfit1$lambda.min.index] # extract estimated coefficients for data 1
+cvfit2 <- cv.trlasso(X2, y2, b_tilde, alpha=0.4) # penalty = lambda * (alpha * ||b||_1 + (1-alpha) * ||b-b_tilde||_1)
+plot(cvfit2) # plot cross-validation curve
+plot(cvfit2$fit) # plot solution path
+```
+
+## References:
+- https://papers.nips.cc/paper/2020/hash/a4a83056b58ff983d12c72bb17996243-Abstract.html
+- https://arxiv.org/abs/2308.15838
